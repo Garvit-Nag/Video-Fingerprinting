@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+import librosa
 import hashlib
 from fastapi import FastAPI, UploadFile, HTTPException
 from typing import List
@@ -69,11 +70,10 @@ async def verify_video(video_file: UploadFile):
         # Generate perceptual hashes for the frames
         frame_hashes = [perceptual_hash(frame) for frame in frames]
         
-        # Compute collective frame hash
-        collective_frame_hash = compute_collective_frame_hash(frame_hashes)
 
         # Initialize audio hash
         audio_hash = None
+        collective_audio_hash = None
 
         if has_audio:
             # Extract audio from the video and save it
@@ -83,6 +83,9 @@ async def verify_video(video_file: UploadFile):
             # Perform audio spectral analysis
             audio_hash = audio_spectral_analysis(audio_path)
             audio_hash = audio_hash.tolist()
+            
+            # Compute collective audio hash
+            collective_audio_hash = compute_collective_audio_hash(audio_path)
 
         # Compute the video-level hash
         video_hash = compute_video_hash(frames)
@@ -95,8 +98,8 @@ async def verify_video(video_file: UploadFile):
         # Return the hashes
     return {
         "frame_hashes": frame_hashes,
-        "collective_frame_hash": collective_frame_hash,
         "audio_hash": audio_hash,
+        "collective_audio_hash": collective_audio_hash,
         "video_hash": video_hash
     }
 
@@ -191,6 +194,31 @@ def extract_audio_from_video(video_path: str, audio_path: str):
 def compute_collective_frame_hash(frame_hashes: List[str]) -> str:
     # Concatenate all frame hashes
     combined_hash = ''.join(frame_hashes)
+    
+    # Compute SHA-256 hash of the combined string
+    return hashlib.sha256(combined_hash.encode()).hexdigest()
+
+def compute_collective_audio_hash(audio_path: str, segment_duration: float = 1.0) -> str:
+    # Load the audio file using librosa (handled inside audio_spectral_analysis)
+    y, sr = librosa.load(audio_path, sr=None)
+    
+    segment_hashes = []
+    
+    # Compute hash for each segment of the audio
+    for start_time in np.arange(0, len(y), int(segment_duration * sr)):
+        end_time = min(start_time + int(segment_duration * sr), len(y))
+        segment = y[start_time:end_time]
+        
+        # Perform spectral analysis on the segment
+        segment_mfcc = librosa.feature.mfcc(y=segment, sr=sr)
+        
+        # Convert the MFCCs to bytes and compute the hash for the segment
+        segment_mfcc_bytes = segment_mfcc.tobytes()
+        segment_hash = hashlib.sha256(segment_mfcc_bytes).hexdigest()
+        segment_hashes.append(segment_hash)
+    
+    # Concatenate all segment hashes
+    combined_hash = ''.join(segment_hashes)
     
     # Compute SHA-256 hash of the combined string
     return hashlib.sha256(combined_hash.encode()).hexdigest()
