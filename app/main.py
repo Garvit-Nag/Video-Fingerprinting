@@ -1,6 +1,8 @@
 import os
+import re
 import tempfile
-from fastapi import FastAPI, UploadFile
+import hashlib
+from fastapi import FastAPI, UploadFile, HTTPException
 from typing import List
 import numpy as np
 import cv2
@@ -15,17 +17,46 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Supported file formats
+SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
+SUPPORTED_IMAGE_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
+
+
 # Load environment variables from .env file
 load_dotenv()
+
+def get_safe_filename(filename):
+    # Create a hash of the original filename
+    hash_object = hashlib.md5(filename.encode())
+    file_hash = hash_object.hexdigest()
+    # Get the file extension
+    _, ext = os.path.splitext(filename)
+    # Return a combination of the hash and the original extension
+    return f"{file_hash}{ext}"
+
+def sanitize_filename(filename):
+    # Get a safe file name
+    filename = get_safe_filename(filename)
+    # Remove any non-word characters (everything except numbers and letters)
+    filename = re.sub(r"[^\w\s-]", "", filename)
+    # Replace all runs of whitespace with a single underscore
+    filename = re.sub(r"\s+", "_", filename)
+    return filename
 
 app = FastAPI()
 
 @app.post("/verify_video")
 async def verify_video(video_file: UploadFile):
-    # Create a temporary directory
+    # Check if the file format is supported
+    file_ext = os.path.splitext(video_file.filename)[1].lower()
+    if file_ext not in SUPPORTED_VIDEO_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported video format. Supported formats are: {', '.join(SUPPORTED_VIDEO_FORMATS)}")
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Save the uploaded video file to the temporary directory
-        video_path = os.path.join(temp_dir, video_file.filename)
+        # Sanitize the filename
+        safe_filename = sanitize_filename(video_file.filename)
+        video_path = os.path.join(temp_dir, safe_filename)
+        
         with open(video_path, "wb") as f:
             f.write(await video_file.read())
 
@@ -37,6 +68,9 @@ async def verify_video(video_file: UploadFile):
 
         # Generate perceptual hashes for the frames
         frame_hashes = [perceptual_hash(frame) for frame in frames]
+        
+        # Compute collective frame hash
+        collective_frame_hash = compute_collective_frame_hash(frame_hashes)
 
         # Initialize audio hash
         audio_hash = None
@@ -59,12 +93,70 @@ async def verify_video(video_file: UploadFile):
             # Handle the uploaded video_url if needed
 
         # Return the hashes
-        return {
-            "frame_hashes": frame_hashes,
-            "audio_hash": audio_hash,
-            "video_hash": video_hash
-        }
+    return {
+        "frame_hashes": frame_hashes,
+        "collective_frame_hash": collective_frame_hash,
+        "audio_hash": audio_hash,
+        "video_hash": video_hash
+    }
 
+@app.post("/verify_video_only")
+async def verify_video_only(video_file: UploadFile):
+    # Check if the file format is supported
+    file_ext = os.path.splitext(video_file.filename)[1].lower()
+    if file_ext not in SUPPORTED_VIDEO_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported video format. Supported formats are: {', '.join(SUPPORTED_VIDEO_FORMATS)}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Sanitize the filename
+        safe_filename = sanitize_filename(video_file.filename)
+        video_path = os.path.join(temp_dir, safe_filename)
+        
+        with open(video_path, "wb") as f:
+            f.write(await video_file.read())
+
+        # Extract frames from the saved video file
+        frames = extract_frames(video_path)
+
+        # Compute the video-level hash
+        video_hash = compute_video_hash(frames)
+
+    # Return only the video hash
+    return {
+        "video_hash": video_hash
+    }
+    
+@app.post("/verify_image")
+async def verify_image(image_file: UploadFile):
+    # Check if the file format is supported
+    file_ext = os.path.splitext(image_file.filename)[1].lower()
+    if file_ext not in SUPPORTED_IMAGE_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format. Supported formats are: {', '.join(SUPPORTED_IMAGE_FORMATS)}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Sanitize the filename
+        safe_filename = sanitize_filename(image_file.filename)
+        image_path = os.path.join(temp_dir, safe_filename)
+        
+        with open(image_path, "wb") as f:
+            f.write(await image_file.read())
+
+        # Read the image using OpenCV
+        image = cv2.imread(image_path)
+        
+        if image is None:
+            raise HTTPException(status_code=400, detail="Unable to process the image")
+
+        # Generate perceptual hash for the image
+        image_hash = perceptual_hash(image)
+
+    # Return the image hash
+    return {
+        "image_hash": image_hash
+    }
+    
+    
+    
 def extract_frames(video_path: str) -> List[np.ndarray]:
     # Use OpenCV to extract frames from the video
     cap = cv2.VideoCapture(video_path)
@@ -95,3 +187,10 @@ def extract_audio_from_video(video_path: str, audio_path: str):
     video = mp.VideoFileClip(video_path)
     if video.audio:
         video.audio.write_audiofile(audio_path)
+        
+def compute_collective_frame_hash(frame_hashes: List[str]) -> str:
+    # Concatenate all frame hashes
+    combined_hash = ''.join(frame_hashes)
+    
+    # Compute SHA-256 hash of the combined string
+    return hashlib.sha256(combined_hash.encode()).hexdigest()
