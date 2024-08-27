@@ -1,75 +1,61 @@
 import os
-import re
-import tempfile
-import librosa
+import asyncio
 import hashlib
-from fastapi import FastAPI, UploadFile, HTTPException
 from typing import List
-import numpy as np
-import cv2
-import moviepy.editor as mp
-from app.utils.perceptual_hashing import perceptual_hash
+import shutil
+from fastapi import FastAPI, UploadFile, HTTPException, File
+from app.services.file_handling import save_uploaded_file, save_uploaded_image
+from app.services.video_processing import (
+    verify_video_format, is_valid_video_file, check_audio_in_video, 
+    extract_frames, extract_audio_from_video, compute_video_hash_only
+)
+from app.services.audio_processing import compute_collective_audio_hash
+from app.utils.perceptual_hashing import perceptual_hash, compute_video_hash
 from app.utils.audio_analysis import audio_spectral_analysis
-from app.utils.video_analysis import compute_video_hash
-from app.cloud_storage_client import upload_to_cloud
-from dotenv import load_dotenv
+from app.services.image_processing import verify_image_format, process_image, compare_images, cleanup_temp_dirs
 import logging
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-# Supported file formats
-SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
-SUPPORTED_IMAGE_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
-
 
 # Load environment variables from .env file
 load_dotenv()
 
-def get_safe_filename(filename):
-    # Create a hash of the original filename
-    hash_object = hashlib.md5(filename.encode())
-    file_hash = hash_object.hexdigest()
-    # Get the file extension
-    _, ext = os.path.splitext(filename)
-    # Return a combination of the hash and the original extension
-    return f"{file_hash}{ext}"
-
-def sanitize_filename(filename):
-    # Get a safe file name
-    filename = get_safe_filename(filename)
-    # Remove any non-word characters (everything except numbers and letters)
-    filename = re.sub(r"[^\w\s-]", "", filename)
-    # Replace all runs of whitespace with a single underscore
-    filename = re.sub(r"\s+", "_", filename)
-    return filename
-
 app = FastAPI()
 
 @app.post("/verify_video")
-async def verify_video(video_file: UploadFile):
+async def verify_video(video_file: UploadFile = File(...)):
+    logger.info(f"Received file: {video_file.filename}")
+    
     # Check if the file format is supported
     file_ext = os.path.splitext(video_file.filename)[1].lower()
-    if file_ext not in SUPPORTED_VIDEO_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Unsupported video format. Supported formats are: {', '.join(SUPPORTED_VIDEO_FORMATS)}")
+    if not file_ext:
+        raise HTTPException(status_code=400, detail="File must have an extension")
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Sanitize the filename
-        safe_filename = sanitize_filename(video_file.filename)
-        video_path = os.path.join(temp_dir, safe_filename)
+    temp_dir = None
+    try:
+        # Save the uploaded file and get both original filename and temporary path
+        original_filename, temp_file_path = save_uploaded_file(video_file)
+        temp_dir = os.path.dirname(temp_file_path)
         
-        with open(video_path, "wb") as f:
-            f.write(await video_file.read())
-
+        logger.info(f"File saved. Original filename: {original_filename}")
+        logger.info(f"Proceeding with video verification using: {temp_file_path}")
+        
+        if not os.path.exists(temp_file_path):
+            raise FileNotFoundError(f"Saved file not found: {temp_file_path}")
+        
+        # Check if the video file is valid
+        if not is_valid_video_file(temp_file_path):
+            raise ValueError(f"Invalid or corrupted video file: {temp_file_path}")
+        
         # Check if the video has an audio track
-        has_audio = check_audio_in_video(video_path)
+        has_audio = check_audio_in_video(temp_file_path)
 
         # Extract frames from the saved video file
-        frames = extract_frames(video_path)
+        frames = await extract_frames(temp_file_path)
 
         # Generate perceptual hashes for the frames
         frame_hashes = [perceptual_hash(frame) for frame in frames]
-        
 
         # Initialize audio hash
         audio_hash = None
@@ -77,8 +63,9 @@ async def verify_video(video_file: UploadFile):
 
         if has_audio:
             # Extract audio from the video and save it
-            audio_path = os.path.join(temp_dir, "audio.wav")
-            extract_audio_from_video(video_path, audio_path)
+            audio_filename = f"audio_{os.path.splitext(os.path.basename(temp_file_path))[0]}.wav"
+            audio_path = os.path.join(temp_dir, audio_filename)
+            extract_audio_from_video(temp_file_path, audio_path)
 
             # Perform audio spectral analysis
             audio_hash = audio_spectral_analysis(audio_path)
@@ -90,107 +77,84 @@ async def verify_video(video_file: UploadFile):
         # Compute the video-level hash
         video_hash = compute_video_hash(frames)
 
-        # Upload to cloud storage if running in production
-        if os.getenv('ENV') == 'production':
-            video_url = await upload_to_cloud(video_file)
-            # Handle the uploaded video_url if needed
+        # Return the hashes and file information
+        return {
+            "frame_hashes": frame_hashes,
+            "audio_hash": audio_hash,
+            "collective_audio_hash": collective_audio_hash,
+            "video_hash": video_hash
+        }
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+    finally:
+        # Clean up the temporary directory
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-        # Return the hashes
-    return {
-        "frame_hashes": frame_hashes,
-        "audio_hash": audio_hash,
-        "collective_audio_hash": collective_audio_hash,
-        "video_hash": video_hash
-    }
 
 @app.post("/verify_video_only")
-async def verify_video_only(video_file: UploadFile):
-    # Check if the file format is supported
-    file_ext = os.path.splitext(video_file.filename)[1].lower()
-    if file_ext not in SUPPORTED_VIDEO_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Unsupported video format. Supported formats are: {', '.join(SUPPORTED_VIDEO_FORMATS)}")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Sanitize the filename
-        safe_filename = sanitize_filename(video_file.filename)
-        video_path = os.path.join(temp_dir, safe_filename)
-        
-        with open(video_path, "wb") as f:
-            f.write(await video_file.read())
-
-        # Extract frames from the saved video file
-        frames = extract_frames(video_path)
-
-        # Compute the video-level hash
-        video_hash = compute_video_hash(frames)
-
-    # Return only the video hash
-    return {
-        "video_hash": video_hash
-    }
+async def verify_video_only(video_file: UploadFile = File(...)):
+    logger.info(f"Received file for video-only verification: {video_file.filename}")
     
+    temp_dir = None
+    try:
+        verify_video_format(video_file.filename)
+        
+        original_filename, temp_file_path = save_uploaded_file(video_file)
+        temp_dir = os.path.dirname(temp_file_path)
+        
+        logger.info(f"File saved. Original filename: {original_filename}")
+        logger.info(f"Proceeding with video-only verification using: {temp_file_path}")
+        
+        video_hash = await compute_video_hash_only(temp_file_path)
+        
+        return {"video_hash": video_hash}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error processing video for video-only verification: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    
+
+
 @app.post("/verify_image")
-async def verify_image(image_file: UploadFile):
-    # Check if the file format is supported
-    file_ext = os.path.splitext(image_file.filename)[1].lower()
-    if file_ext not in SUPPORTED_IMAGE_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Unsupported image format. Supported formats are: {', '.join(SUPPORTED_IMAGE_FORMATS)}")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Sanitize the filename
-        safe_filename = sanitize_filename(image_file.filename)
-        image_path = os.path.join(temp_dir, safe_filename)
+async def verify_image(image_file: UploadFile = File(...)):
+    verify_image_format(image_file.filename)
+    temp_dir = None
+    try:
+        original_filename, temp_file_path = save_uploaded_image(image_file)
+        temp_dir = os.path.dirname(temp_file_path)
         
-        with open(image_path, "wb") as f:
-            f.write(await image_file.read())
-
-        # Read the image using OpenCV
-        image = cv2.imread(image_path)
+        logger.info(f"Image saved. Original filename: {original_filename}")
+        logger.info(f"Proceeding with image verification using: {temp_file_path}")
         
-        if image is None:
-            raise HTTPException(status_code=400, detail="Unable to process the image")
-
-        # Generate perceptual hash for the image
-        image_hash = perceptual_hash(image)
-
-    # Return the image hash
-    return {
-        "image_hash": image_hash
-    }
-    
-    
-    
-def extract_frames(video_path: str) -> List[np.ndarray]:
-    # Use OpenCV to extract frames from the video
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logging.error("Could not open video.")
-        return frames
-    
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    cap.release()
-    if not frames:
-        logging.warning("No frames extracted.")
+        image_hash = process_image(temp_file_path)
         
-    logging.info(f"Extracted {len(frames)} frames from video.")
-    return frames
+        return {"image_hash": image_hash}
+    finally:
+        cleanup_temp_dirs([temp_dir])
 
-def check_audio_in_video(video_path: str) -> bool:
-    # Use moviepy to check if the video has an audio track
-    video = mp.VideoFileClip(video_path)
-    return video.audio is not None
-
-def extract_audio_from_video(video_path: str, audio_path: str):
-    # Use moviepy to extract audio from video
-    video = mp.VideoFileClip(video_path)
-    if video.audio:
-        video.audio.write_audiofile(audio_path)
+@app.post("/compare_images")
+async def compare_images_endpoint(image1: UploadFile = File(...), image2: UploadFile = File(...)):
+    verify_image_format(image1.filename)
+    verify_image_format(image2.filename)
+    temp_dirs = []
+    try:
+        original_filename1, temp_file_path1 = save_uploaded_image(image1)
+        original_filename2, temp_file_path2 = save_uploaded_image(image2)
         
+        temp_dirs.extend([os.path.dirname(temp_file_path1), os.path.dirname(temp_file_path2)])
+        
+        result = compare_images(temp_file_path1, temp_file_path2)
+        
+        return result
+    finally:
+        cleanup_temp_dirs(temp_dirs)
+    
 def compute_collective_frame_hash(frame_hashes: List[str]) -> str:
     # Concatenate all frame hashes
     combined_hash = ''.join(frame_hashes)
@@ -198,27 +162,4 @@ def compute_collective_frame_hash(frame_hashes: List[str]) -> str:
     # Compute SHA-256 hash of the combined string
     return hashlib.sha256(combined_hash.encode()).hexdigest()
 
-def compute_collective_audio_hash(audio_path: str, segment_duration: float = 1.0) -> str:
-    # Load the audio file using librosa (handled inside audio_spectral_analysis)
-    y, sr = librosa.load(audio_path, sr=None)
-    
-    segment_hashes = []
-    
-    # Compute hash for each segment of the audio
-    for start_time in np.arange(0, len(y), int(segment_duration * sr)):
-        end_time = min(start_time + int(segment_duration * sr), len(y))
-        segment = y[start_time:end_time]
-        
-        # Perform spectral analysis on the segment
-        segment_mfcc = librosa.feature.mfcc(y=segment, sr=sr)
-        
-        # Convert the MFCCs to bytes and compute the hash for the segment
-        segment_mfcc_bytes = segment_mfcc.tobytes()
-        segment_hash = hashlib.sha256(segment_mfcc_bytes).hexdigest()
-        segment_hashes.append(segment_hash)
-    
-    # Concatenate all segment hashes
-    combined_hash = ''.join(segment_hashes)
-    
-    # Compute SHA-256 hash of the combined string
-    return hashlib.sha256(combined_hash.encode()).hexdigest()
+
