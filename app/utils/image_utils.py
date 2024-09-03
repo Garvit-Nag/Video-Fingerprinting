@@ -3,6 +3,22 @@ import cv2
 import numpy as np
 from typing import Union
 from PIL import Image
+from io import BytesIO
+
+# Creating a BytesIO object
+buffer = BytesIO()
+
+# Writing binary data to the buffer
+buffer.write(b"Hello, this is some binary data!")
+
+# Moving the cursor to the beginning of the buffer
+buffer.seek(0)
+
+# Reading data from the buffer
+data = buffer.read()
+
+print(data)  # Output: b'Hello,
+
 import imghdr
 from fastapi import HTTPException
 
@@ -68,11 +84,9 @@ def process_image(temp_file_path: str):
         if not os.path.exists(temp_file_path):
             raise FileNotFoundError(f"Saved image not found: {temp_file_path}")
         
-        with Image.open(temp_file_path) as img:
-            img.verify()
-        
-        with Image.open(temp_file_path) as img:
-            image_hash = perceptual_image_hash(img)
+        img = Image.open(BytesIO(temp_file_path))
+        img.verify()
+        image_hash = perceptual_image_hash(img)
         
         return image_hash
     except Exception as e:
@@ -80,9 +94,10 @@ def process_image(temp_file_path: str):
 
 def compare_images(temp_file_path1: str, temp_file_path2: str):
     try:
-        with Image.open(temp_file_path1) as img1, Image.open(temp_file_path2) as img2:
-            hash1 = perceptual_image_hash(img1)
-            hash2 = perceptual_image_hash(img2)
+        img1 = Image.open(BytesIO(temp_file_path1))
+        img2 = Image.open(BytesIO(temp_file_path2))
+        hash1 = perceptual_image_hash(img1)
+        hash2 = perceptual_image_hash(img2)
         
         are_similar = are_images_similar(hash1, hash2)
         distance = hamming_distance(hash1, hash2)

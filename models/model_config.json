@@ -1,0 +1,1 @@
+{"img_width": 224, "img_height": 224, "class_labels": {"real": 0, "spoof": 1}, "threshold": 0.5}
