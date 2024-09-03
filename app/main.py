@@ -1,10 +1,15 @@
 from fastapi import FastAPI
 from app.api.routes import router
 from app.core.logging_config import configure_logging
+from app.core.firebase_config import initialize_firebase
 
 app = FastAPI()
-app.include_router(router)
 
+@app.on_event("startup")
+async def startup_event():
+    initialize_firebase()
+
+app.include_router(router)
 configure_logging()
 
 if __name__ == "__main__":

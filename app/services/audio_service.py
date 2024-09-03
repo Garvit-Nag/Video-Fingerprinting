@@ -3,31 +3,21 @@ import librosa
 import imagehash
 from PIL import Image
 import logging
+import io
 import subprocess
 import os
 from pydub import AudioSegment
 
-def extract_audio_features(video_path):
-    logging.info(f"Extracting audio features from: {video_path}")
+def extract_audio_features(video_bytes):
+    logging.info("Extracting audio features")
     try:
-        # Use ffmpeg to extract audio to a temporary wav file
-        temp_audio_path = video_path + ".wav"
-        subprocess.run(["ffmpeg", "-i", video_path, "-acodec", "pcm_s16le", "-ar", "44100", temp_audio_path], 
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # Load the audio file using librosa
-        y, sr = librosa.load(temp_audio_path, sr=None)
+        # Use librosa to load audio from bytes
+        y, sr = librosa.load(io.BytesIO(video_bytes), sr=None)
         
         # Extract MFCC features
         mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         
-        # Clean up temporary audio file
-        os.remove(temp_audio_path)
-        
         return mfcc
-    except subprocess.CalledProcessError as e:
-        logging.error(f"FFmpeg error: {str(e)}")
-        raise
     except Exception as e:
         logging.error(f"Error extracting audio features: {str(e)}")
         raise
@@ -42,9 +32,9 @@ def compute_audio_hash(features):
     features_2d = (features_2d * 255).astype(np.uint8)
     return imagehash.phash(Image.fromarray(features_2d))
 
-def compute_audio_hashes(video_path):
-    logging.info("Computing audio hashes from: %s", video_path)
-    audio = AudioSegment.from_file(video_path)
+def compute_audio_hashes(video_bytes):
+    logging.info("Computing audio hashes")
+    audio = AudioSegment.from_file(io.BytesIO(video_bytes))
     samples = np.array(audio.get_array_of_samples())
     mfccs = librosa.feature.mfcc(y=samples.astype(float), sr=audio.frame_rate, n_mfcc=13)
     audio_hashes = []
